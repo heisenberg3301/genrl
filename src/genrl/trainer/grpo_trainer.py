@@ -68,7 +68,7 @@ class GRPOTrainerConfig:
     bnb_4bit_quant_type: str = "nf4"
 
 
-class GRPOQLoRATrainerModule(TrainerModule, LoggerMixin):
+class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     """
     GRPO trainer that supports training LoRA adapters (QLoRA) on 4-bit quantized models.
 
@@ -526,7 +526,7 @@ class GRPOQLoRATrainerModule(TrainerModule, LoggerMixin):
         torch.save({"metrics": self._metrics, "total_train_tokens": self._total_train_tokens, "generation_config": self.generation_config}, os.path.join(save_dir, "trainer_state.pt"))
 
     @classmethod
-    def load(cls, load_dir: str) -> "GRPOQLoRATrainerModule":
+    def load(cls, load_dir: str) -> "GRPOLanguageTrainerModule":
         model = AutoModelForCausalLM.from_pretrained(load_dir)
         trainer = cls([model])
         trainer_state = torch.load(os.path.join(load_dir, "trainer_state.pt"))
