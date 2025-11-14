@@ -79,9 +79,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         # Chỉ set dtype nếu KHÔNG phải quantized model
         if self.is_quantized:
             self.dtype = None  # Không cast dtype cho quantized models
-            print("Detected quantized model - disabling dtype casting")
+            self.compute_dtype = torch.float32  # Dùng float32 cho computation
+            print("🔧 Detected 8-bit quantized model - using float32 for computations")
         else:
             self.dtype = DTYPE_MAP.get(self.args.dtype, None)
+            self.compute_dtype = self.dtype if self.dtype is not None else torch.float32
         
         self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
 
@@ -102,51 +104,72 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def _detect_quantization(self):
         """Detect if model is quantized"""
         model_type_str = str(type(self.model)).lower()
-        return (
+        is_quant = (
             hasattr(self.model, "is_quantized")
             or hasattr(self.model, "is_loaded_in_4bit")
             or hasattr(self.model, "is_loaded_in_8bit")
             or "bitsandbytes" in model_type_str
             or "bnb" in model_type_str
         )
+        
+        # Extra check: xem model có quantization_config không
+        if hasattr(self.model, "config") and hasattr(self.model.config, "quantization_config"):
+            is_quant = True
+            
+        return is_quant
 
     def _initialize_model(self, enable_gradient_checkpointing):
         """Initialize the model and reference model."""
         if self.is_quantized:
             # Quantized model - chỉ move device, KHÔNG cast dtype
+            print(f"✓ Model is quantized, keeping original precision")
             try:
                 self.model = self.model.to(device=self.device)
-            except Exception:
+            except Exception as e:
                 # device_map có thể đã được set
+                print(f"  Note: Model already on device ({e})")
                 pass
             
-            # Disable use_cache cho quantized models
+            # Disable use_cache cho quantized models (QUAN TRỌNG!)
             if hasattr(self.model, "config"):
-                self.model.config.use_cache = False
-            
-            if enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
                 try:
-                    self.model.gradient_checkpointing_enable()
-                except Exception as e:
-                    print(f"Warning: Could not enable gradient checkpointing: {e}")
+                    self.model.config.use_cache = False
+                    print("✓ Disabled use_cache for stable training")
+                except:
+                    pass
+            
+            # Gradient checkpointing
+            if enable_gradient_checkpointing:
+                if hasattr(self.model, "gradient_checkpointing_enable"):
+                    try:
+                        self.model.gradient_checkpointing_enable()
+                        print("✓ Enabled gradient checkpointing")
+                    except Exception as e:
+                        print(f"⚠ Could not enable gradient checkpointing: {e}")
         else:
             # Non-quantized model - cast dtype bình thường
+            print(f"✓ Non-quantized model, using dtype: {self.dtype}")
             if self.dtype is not None:
                 self.model = self.model.to(device=self.device, dtype=self.dtype)
             else:
                 self.model = self.model.to(device=self.device)
             
             if enable_gradient_checkpointing:
-                self.model.gradient_checkpointing_enable()
+                try:
+                    self.model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
 
         # Reference model setup
         if self.args.beta == 0.0:
             self.ref_model = None
+            print("✓ No reference model (beta=0)")
         else:
             try:
+                print("✓ Creating reference model...")
                 self.ref_model = create_reference_model(self.model).to(device=self.device)
             except Exception as e:
-                print(f"Warning: Could not create reference model: {e}")
+                print(f"⚠ Could not create reference model: {e}")
                 self.ref_model = None
 
     def _initialize_tokenizers(self):
@@ -158,7 +181,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     self.processing_class = AutoTokenizer.from_pretrained(
                         model_name, padding_side="left"
                     )
-            except Exception:
+                    print(f"✓ Loaded tokenizer from {model_name}")
+            except Exception as e:
+                print(f"⚠ Could not load tokenizer: {e}")
                 self.processing_class = None
 
     def _initialize_metrics(self):
@@ -168,12 +193,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     def _initialize_generation_config(self):
         """Set generation config - safer defaults for quantized models"""
-        # Cho quantized models, dùng greedy decoding
+        # Cho quantized models, dùng greedy decoding để tránh numerical instability
         if self.is_quantized:
             base_do_sample = False
             temp = 1.0
             top_p = 1.0
             top_k = 1
+            print("✓ Using greedy decoding for quantized model")
         else:
             base_do_sample = bool(self.args.temperature and self.args.temperature > 0.0)
             temp = self.args.temperature
@@ -253,6 +279,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 "top_k": 1,
                 "top_p": 1.0,
                 "temperature": 1.0,
+                "max_new_tokens": self.args.max_new_tokens,
             }
         else:
             gen_kwargs = {
@@ -268,25 +295,36 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             gen_kwargs["eos_token_id"] = eos_id
         
         input_ids = input_tokens.input_ids.to(self.model.device)
-        # QUAN TRỌNG: attention_mask LUÔN LUÔN phải là torch.long
+        # CRITICAL: attention_mask MUST always be torch.long
         attention_mask = input_tokens.attention_mask.to(self.model.device, dtype=torch.long)
         prompt_length = input_ids.size(1)
         
-        for _ in range(self.args.num_generations):
+        for gen_idx in range(self.args.num_generations):
             with torch.no_grad():
-                # Cho quantized models, generate từng sample để ổn định hơn
+                # Cho quantized models với batch > 1, generate per-sample để stability
                 if self.is_quantized and input_ids.size(0) > 1:
                     outputs_list = []
                     for i in range(input_ids.size(0)):
                         ids = input_ids[i:i+1]
                         mask = attention_mask[i:i+1]
-                        out = self.model.generate(ids, attention_mask=mask, **gen_kwargs)
-                        outputs_list.append(out)
+                        try:
+                            out = self.model.generate(ids, attention_mask=mask, **gen_kwargs)
+                            outputs_list.append(out)
+                        except Exception as e:
+                            print(f"⚠ Generation error for sample {i}: {e}")
+                            # Fallback: return input + padding
+                            out = torch.cat([ids, torch.full((1, 10), pad_id or 0, device=ids.device)], dim=1)
+                            outputs_list.append(out)
                     outputs = torch.cat(outputs_list, dim=0)
                 else:
-                    outputs = self.model.generate(
-                        input_ids, attention_mask=attention_mask, **gen_kwargs
-                    )
+                    try:
+                        outputs = self.model.generate(
+                            input_ids, attention_mask=attention_mask, **gen_kwargs
+                        )
+                    except Exception as e:
+                        print(f"⚠ Generation error: {e}")
+                        # Fallback
+                        outputs = torch.cat([input_ids, torch.full((input_ids.size(0), 10), pad_id or 0, device=input_ids.device)], dim=1)
 
             # Extract completions
             completion_ids = outputs[:, prompt_length:]
@@ -310,7 +348,10 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             return rollout
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
-        """Get the per-token log probabilities for the input tokens."""
+        """
+        Get the per-token log probabilities for the input tokens.
+        CRITICAL FIX: Use float32 for loss_mask to avoid dtype issues with quantized models.
+        """
         logits = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -318,29 +359,38 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         ).logits
         logits = logits[:, :-1, :]
 
-        # QUAN TRỌNG: loss_mask phải cùng dtype với logits
+        # CRITICAL FIX: loss_mask MUST be float32 for quantized models
+        # Không dùng logits.dtype vì có thể mixed precision
         loss_mask = (
             attention_mask[:, -logits_to_keep:]
-            .to(device=logits.device, dtype=logits.dtype)
+            .to(device=logits.device, dtype=torch.float32)  # ← LUÔN dùng float32
             .contiguous()
         )
         labels = input_ids[:, -logits_to_keep:].contiguous()
         logits = logits[:, -logits_to_keep:].contiguous()
 
-        # Divide logits by sampling temperature
-        logits = logits / max(1e-8, float(self.args.temperature))
+        # Divide logits by temperature (with safety check)
+        temp = max(1e-8, float(self.args.temperature))
+        logits = logits / temp
         
         logits_shape = logits.shape
+        
+        # Compute cross entropy in float32 for numerical stability
+        logits_for_ce = logits.float() if logits.dtype != torch.float32 else logits
+        
         token_log_probs = -torch.nn.functional.cross_entropy(
-            logits.view(-1, logits_shape[-1]),
+            logits_for_ce.view(-1, logits_shape[-1]),
             labels.view(-1),
             reduction="none",
         ).view(logits_shape[0], logits_shape[1])
         
+        # Apply mask (both in float32)
+        token_log_probs = token_log_probs.float()
         token_log_probs = (
             token_log_probs * loss_mask
-            + (1.0 - loss_mask) * torch.finfo(logits.dtype).min
+            + (1.0 - loss_mask) * torch.finfo(torch.float32).min
         )
+        
         return token_log_probs
 
     def compute_loss(
@@ -354,7 +404,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         )
 
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
-        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        # CRITICAL: attention_mask MUST always be torch.long
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
             self.model.device, dtype=torch.long
         )
@@ -384,7 +434,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         if old_per_token_logps is None:
             old_per_token_logps = per_token_logps.detach()
 
-        # Calculate ratios and loss terms
+        # Calculate ratios and loss terms (all in float32)
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(
             coef_1,
@@ -401,14 +451,21 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         if self.args.beta != 0.0:
             per_token_loss = per_token_loss + self.args.beta * per_token_kl
 
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+        # Convert completion_mask to float32 for computation
+        completion_mask_float = completion_mask.float()
+        loss = (per_token_loss * completion_mask_float).sum() / (completion_mask_float.sum() + 1e-8)
+
+        # Check for invalid loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"⚠ WARNING: Invalid loss detected (NaN or Inf), setting to 0")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
 
         if self.args.beta != 0.0:
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+            mean_kl = (per_token_kl * completion_mask_float).sum() / (completion_mask_float.sum() + 1e-8)
             self._metrics[mode]["kl"].append(mean_kl.item())
 
         is_clipped = (per_token_loss1 < per_token_loss2).float()
-        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+        clip_ratio = (is_clipped * completion_mask_float).sum() / (completion_mask_float.sum() + 1e-8)
         self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
         self._metrics[mode]["loss"].append(loss.item())
 
@@ -466,7 +523,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         model_inputs = {}
         processed_inputs = self._process_inputs(stage_inputs, for_training=True)
         model_inputs["prompt_ids"] = processed_inputs.input_ids.to(self.model.device)
-        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        # CRITICAL: attention_mask MUST always be torch.long
         model_inputs["prompt_mask"] = processed_inputs.attention_mask.to(
             self.model.device, dtype=torch.long
         )
@@ -475,7 +532,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             stage_outputs, with_template=False, for_training=True
         )
         model_inputs["completion_ids"] = processed_outputs.input_ids.to(self.model.device)
-        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        # CRITICAL: attention_mask MUST always be torch.long
         model_inputs["completion_mask"] = processed_outputs.attention_mask.to(
             self.model.device, dtype=torch.long
         )
@@ -491,8 +548,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         
         # Validate rewards
         if torch.isnan(rewards).any() or torch.isinf(rewards).any():
-            print(f"Warning: Invalid rewards at stage {stage}, cleaning...")
+            print(f"⚠ WARNING: Invalid rewards at stage {stage}, cleaning...")
             rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # DEBUG: Print reward stats
+        print(f"📊 Stage {stage} | Rewards - mean: {rewards.mean():.4f}, std: {rewards.std():.4f}, min: {rewards.min():.4f}, max: {rewards.max():.4f}")
         
         do_training = (rewards != 0).any()
         
@@ -500,12 +560,16 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             with torch.no_grad():
                 advantages = rewards - rewards.mean(dim=1, keepdim=True)
                 if rewards.shape[1] > 1:
-                    advantages /= rewards.std(dim=1, keepdim=True) + 1e-8
+                    std = rewards.std(dim=1, keepdim=True)
+                    advantages /= (std + 1e-8)
+                
+                # DEBUG: Print advantage stats
+                print(f"📊 Advantages - mean: {advantages.mean():.4f}, std: {advantages.std():.4f}")
 
                 prompt_ids, prompt_mask = model_inputs["prompt_ids"], model_inputs["prompt_mask"]
                 completion_ids, completion_mask = model_inputs["completion_ids"], model_inputs["completion_mask"]
                 input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
-                # QUAN TRỌNG: attention_mask LUÔN là torch.long
+                # CRITICAL: attention_mask MUST always be torch.long
                 attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
                     self.model.device, dtype=torch.long
                 )
@@ -514,7 +578,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     self.model, input_ids, attention_mask, logits_to_keep
                 ).detach()
 
-            # QUAN TRỌNG: advantages luôn là float32
+            # CRITICAL: advantages MUST be float32
             advantages = torch.flatten(advantages).to(self.model.device, dtype=torch.float32)
             model_inputs["advantages"] = advantages.squeeze(dim=-1)
             
@@ -523,20 +587,31 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             minibatch_size = min(self.args.minibatch_size, num_samples)
             
             loss_vals = []
-            for _ in range(updates_per_rollout):
+            for epoch in range(updates_per_rollout):
                 perm = torch.randperm(num_samples, device=self.model.device)
                 for start in range(0, num_samples, minibatch_size):
                     idx = perm[start : start + minibatch_size]
                     mb_inputs = self._return_minibatch(model_inputs, idx, old_per_token_logps_full)
                     self.model.zero_grad()
                     loss = self.compute_loss(self.model, mb_inputs)
+                    
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"⚠ Skipping backward due to invalid loss")
+                        continue
+                        
                     loss.backward()
+                    
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
                     self.optimizer.step()
                     loss_vals.append(loss.detach().float())
 
             mean_loss = torch.stack(loss_vals).mean() if loss_vals else torch.tensor(0.0)
+            print(f"✓ Training completed | Loss: {mean_loss:.4f}")
         else:
             mean_loss = torch.tensor(0.0)
+            print(f"⊘ No training (all rewards are zero)")
 
         metrics.update({"train/loss": mean_loss.cpu().item()})
         metrics.update({"train/rewards": rewards.cpu().mean().item()})
@@ -568,7 +643,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         # Save model using HuggingFace method
         try:
             self.model.save_pretrained(save_dir)
-        except Exception:
+            print(f"✓ Model saved to {save_dir}")
+        except Exception as e:
+            print(f"⚠ Could not use save_pretrained, using torch.save: {e}")
             torch.save(self.model.state_dict(), os.path.join(save_dir, "model_state.pt"))
 
         # Save additional state
