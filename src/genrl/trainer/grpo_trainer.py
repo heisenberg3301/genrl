@@ -3,7 +3,7 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -18,12 +18,13 @@ from genrl.trainer.trainer_utils import DTYPE_MAP
 from genrl.logging_utils.global_defs import get_logger
 
 
-def create_reference_model(model: torch.nn.Module) -> torch.nn.Module:
+def create_reference_model(
+    model: torch.nn.Module
+) -> torch.nn.Module:
     ref_model = deepcopy(model)
     for param in ref_model.parameters():
         param.requires_grad = False
     return ref_model.eval()
-
 
 @dataclass
 class GRPOTrainerConfig:
@@ -37,8 +38,8 @@ class GRPOTrainerConfig:
     num_generations: int = 2
     learning_rate: float = 1e-6
     top_p: float = 1.0
-    top_k: Optional[int] = None
-    min_p: Optional[float] = None
+    top_k: int | None = None
+    min_p: float | None = None
     repetition_penalty: float = 1.0
     ppo_epochs: int = 1
     minibatch_size: int = 2
@@ -47,7 +48,7 @@ class GRPOTrainerConfig:
 class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method.
-    Modified to safely support BitsAndBytes quantized models (4-bit).
+    Modified to support BitsAndBytes 8-bit quantization.
     """
 
     def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
@@ -57,14 +58,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self.model = models[0]
         self.args = config
 
-        # safe dtype lookup: do not KeyError if user passed 'auto' or unknown
-        self.dtype = DTYPE_MAP.get(self.args.dtype, None)  # None means "don't cast"
-
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.args.learning_rate
         )
 
-        # Tokenizers / processing class
+        # Tokenizers
         self.processing_class = kwargs.get("processing_class", None)
 
         # Additional parameters
@@ -74,10 +72,19 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         assert (
             self.args.num_generations > 1
         ), f"For GRPO training, number of generations must be > 1, got {self.args.num_generations}"
-
+        
+        # Detect quantization TRƯỚC khi set dtype
+        self.is_quantized = self._detect_quantization()
+        
+        # Chỉ set dtype nếu KHÔNG phải quantized model
+        if self.is_quantized:
+            self.dtype = None  # Không cast dtype cho quantized models
+            print("Detected quantized model - disabling dtype casting")
+        else:
+            self.dtype = DTYPE_MAP.get(self.args.dtype, None)
+        
         self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
 
-        # device selection
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         elif torch.backends.mps.is_available():
@@ -92,116 +99,87 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self._initialize_generation_config()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
-    # ---------------------------
-    # Model initialization
-    # ---------------------------
-    def _initialize_model(self, enable_gradient_checkpointing):
-        """
-        Initialize the model and reference model.
-        Important: if model is bitsandbytes-quantized, DO NOT cast dtype.
-        """
-
-        # detect bitsandbytes / quantized model heuristically
+    def _detect_quantization(self):
+        """Detect if model is quantized"""
         model_type_str = str(type(self.model)).lower()
-        is_quantized = (
+        return (
             hasattr(self.model, "is_quantized")
             or hasattr(self.model, "is_loaded_in_4bit")
+            or hasattr(self.model, "is_loaded_in_8bit")
             or "bitsandbytes" in model_type_str
             or "bnb" in model_type_str
         )
 
-        if is_quantized:
-            # Move to device but DO NOT cast dtype
+    def _initialize_model(self, enable_gradient_checkpointing):
+        """Initialize the model and reference model."""
+        if self.is_quantized:
+            # Quantized model - chỉ move device, KHÔNG cast dtype
             try:
                 self.model = self.model.to(device=self.device)
             except Exception:
-                # device_map handling may already be applied; ignore
+                # device_map có thể đã được set
                 pass
-
-            # disable use_cache for quantized models (can cause issues)
-            try:
-                if hasattr(self.model, "config"):
-                    self.model.config.use_cache = False
-            except Exception:
-                pass
-
+            
+            # Disable use_cache cho quantized models
+            if hasattr(self.model, "config"):
+                self.model.config.use_cache = False
+            
             if enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
                 try:
                     self.model.gradient_checkpointing_enable()
-                except Exception:
-                    pass
-
-            # reference model only if beta != 0 and desired
-            if self.args.beta == 0.0:
-                self.ref_model = None
-            else:
-                try:
-                    self.ref_model = create_reference_model(self.model).to(device=self.device)
-                except Exception:
-                    self.ref_model = None
-
-            return
-
-        # Non-quantized path: perform dtype cast if dtype was set
-        if self.dtype is not None:
-            try:
-                self.model = self.model.to(device=self.device, dtype=self.dtype)
-            except Exception:
-                # fallback to device only
-                self.model = self.model.to(device=self.device)
+                except Exception as e:
+                    print(f"Warning: Could not enable gradient checkpointing: {e}")
         else:
-            self.model = self.model.to(device=self.device)
-
-        if enable_gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
-            try:
+            # Non-quantized model - cast dtype bình thường
+            if self.dtype is not None:
+                self.model = self.model.to(device=self.device, dtype=self.dtype)
+            else:
+                self.model = self.model.to(device=self.device)
+            
+            if enable_gradient_checkpointing:
                 self.model.gradient_checkpointing_enable()
-            except Exception:
-                pass
 
-        # reference model
+        # Reference model setup
         if self.args.beta == 0.0:
             self.ref_model = None
         else:
             try:
-                self.ref_model = create_reference_model(self.model).to(device=self.device, dtype=self.dtype if self.dtype is not None else None)
-            except Exception:
+                self.ref_model = create_reference_model(self.model).to(device=self.device)
+            except Exception as e:
+                print(f"Warning: Could not create reference model: {e}")
                 self.ref_model = None
 
-    # ---------------------------
-    # Tokenizer init
-    # ---------------------------
     def _initialize_tokenizers(self):
+        """Initialize tokenizers for the model and reward models."""
         if self.processing_class is None:
-            # Try to load AutoTokenizer from model config name if available
             try:
                 model_name = getattr(self.model.config, "_name_or_path", None)
                 if model_name:
-                    self.processing_class = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-                else:
-                    self.processing_class = None
+                    self.processing_class = AutoTokenizer.from_pretrained(
+                        model_name, padding_side="left"
+                    )
             except Exception:
                 self.processing_class = None
 
-    # ---------------------------
-    # Metrics init
-    # ---------------------------
     def _initialize_metrics(self):
+        """Initialize metrics tracking for training and evaluation."""
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
 
-    # ---------------------------
-    # Generation config init
-    # ---------------------------
     def _initialize_generation_config(self):
-        """
-        Create a base GenerationConfig.
-        For quantized models we will override to GREEDY/safe settings when generating.
-        """
-        # choose default do_sample based on temperature: but we'll override for quantized models
-        base_do_sample = bool(self.args.temperature and self.args.temperature > 0.0)
-
-        # Graceful defaults; note: GenerationConfig stores the values but model.generate
-        # can be passed kwargs to override per-call.
+        """Set generation config - safer defaults for quantized models"""
+        # Cho quantized models, dùng greedy decoding
+        if self.is_quantized:
+            base_do_sample = False
+            temp = 1.0
+            top_p = 1.0
+            top_k = 1
+        else:
+            base_do_sample = bool(self.args.temperature and self.args.temperature > 0.0)
+            temp = self.args.temperature
+            top_p = self.args.top_p
+            top_k = self.args.top_k if self.args.top_k is not None else 50
+        
         try:
             pad_id = getattr(self.processing_class, "pad_token_id", None)
             bos_id = getattr(self.processing_class, "bos_token_id", None)
@@ -215,16 +193,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             pad_token_id=pad_id,
             bos_token_id=bos_id,
             eos_token_id=eos_id,
-            temperature=self.args.temperature,
-            top_p=self.args.top_p,
-            top_k=self.args.top_k if self.args.top_k is not None else 50,
+            temperature=temp,
+            top_p=top_p,
+            top_k=top_k,
             min_p=self.args.min_p,
             repetition_penalty=self.args.repetition_penalty,
         )
 
-    # ---------------------------
-    # Input processing helper
-    # ---------------------------
     def _process_inputs(self, inputs, with_template=True, for_training=False):
         if hasattr(inputs, "to_dict"):
             inputs = [dict(inputs[i]) for i in range(len(inputs))]
@@ -237,11 +212,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 for item in inputs:
                     for _ in range(self.args.num_generations):
                         templated_prompts.append(
-                            self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
+                            self.processing_class.apply_chat_template(
+                                item["prompt"], tokenize=False, add_generation_prompt=True
+                            )
                         )
             else:
                 templated_prompts = [
-                    self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
+                    self.processing_class.apply_chat_template(
+                        item["prompt"], tokenize=False, add_generation_prompt=True
+                    )
                     for item in inputs
                 ]
         else:
@@ -253,36 +232,20 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             else:
                 templated_prompts = [item[0] for item in inputs]
 
-        # tokenization: return tensors with padding
         input_tokens = self.processing_class(
             text=templated_prompts, return_tensors="pt", padding=True, truncation=True
         )
         return input_tokens
 
-    # ---------------------------
-    # Generate (used by game manager)
-    # ---------------------------
-    def generate(self, inputs: Any, return_completion_ids: bool = False, stage=0) -> Any:
-        """
-        Generate outputs from the model for the given inputs.
-        This method keeps backward compatibility with previous genrl API.
-        It will call model.generate with safe kwargs when model is quantized.
-        """
-
+    def generate(
+        self, inputs: Any, return_completion_ids: bool = False, stage=0
+    ) -> Any:
+        """Generate outputs from the model for the given inputs."""
         input_tokens = self._process_inputs(inputs)
         rollout, rollout_ids = [], []
-
-        # Detect if model is quantized (same heuristic as _initialize_model)
-        model_type_str = str(type(self.model)).lower()
-        is_quantized = (
-            hasattr(self.model, "is_quantized")
-            or hasattr(self.model, "is_loaded_in_4bit")
-            or "bitsandbytes" in model_type_str
-            or "bnb" in model_type_str
-        )
-
-        # Prepare per-call generation kwargs. For quantized models, enforce greedy safe config.
-        if is_quantized:
+        
+        # Prepare generation kwargs - safer for quantized models
+        if self.is_quantized:
             gen_kwargs = {
                 "do_sample": False,
                 "num_beams": 1,
@@ -292,47 +255,44 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 "temperature": 1.0,
             }
         else:
-            # non-quantized: use generation_config defaults but allow overrides
             gen_kwargs = {
-                "do_sample": self.generation_config.do_sample,
-                "temperature": self.generation_config.temperature,
-                "top_k": self.generation_config.top_k,
-                "top_p": self.generation_config.top_p,
-                "repetition_penalty": self.generation_config.repetition_penalty,
-                "use_cache": True,
+                "generation_config": self.generation_config,
             }
-
-        # pass pad/eos
+        
+        # Add pad/eos tokens
         pad_id = getattr(self.processing_class, "pad_token_id", None)
         eos_id = getattr(self.processing_class, "eos_token_id", None)
         if pad_id is not None:
             gen_kwargs["pad_token_id"] = pad_id
         if eos_id is not None:
             gen_kwargs["eos_token_id"] = eos_id
-
-        # run multiple generations
+        
         input_ids = input_tokens.input_ids.to(self.model.device)
+        # QUAN TRỌNG: attention_mask LUÔN LUÔN phải là torch.long
         attention_mask = input_tokens.attention_mask.to(self.model.device, dtype=torch.long)
-
-        prompt_len = input_ids.size(1)
-
+        prompt_length = input_ids.size(1)
+        
         for _ in range(self.args.num_generations):
             with torch.no_grad():
-                # For quantized models do per-sample generation for stability
-                if is_quantized and input_ids.size(0) > 1:
+                # Cho quantized models, generate từng sample để ổn định hơn
+                if self.is_quantized and input_ids.size(0) > 1:
                     outputs_list = []
                     for i in range(input_ids.size(0)):
-                        ids = input_ids[i : i + 1]
-                        mask = attention_mask[i : i + 1]
+                        ids = input_ids[i:i+1]
+                        mask = attention_mask[i:i+1]
                         out = self.model.generate(ids, attention_mask=mask, **gen_kwargs)
                         outputs_list.append(out)
                     outputs = torch.cat(outputs_list, dim=0)
                 else:
-                    outputs = self.model.generate(input_ids, attention_mask=attention_mask, **gen_kwargs)
+                    outputs = self.model.generate(
+                        input_ids, attention_mask=attention_mask, **gen_kwargs
+                    )
 
-            # Extract completions (after prompt length)
-            completion_ids = outputs[:, prompt_len:]
-            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            # Extract completions
+            completion_ids = outputs[:, prompt_length:]
+            completions = self.processing_class.batch_decode(
+                completion_ids, skip_special_tokens=True
+            )
 
             if len(rollout) == 0:
                 rollout = [[comp] for comp in completions]
@@ -343,16 +303,14 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     rollout[idx].append(comp)
                     if return_completion_ids:
                         rollout_ids[idx].append(completion_ids[idx])
-
+        
         if return_completion_ids:
             return rollout, rollout_ids
         else:
             return rollout
 
-    # ---------------------------
-    # per-token logprobs helper
-    # ---------------------------
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        """Get the per-token log probabilities for the input tokens."""
         logits = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -360,47 +318,73 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         ).logits
         logits = logits[:, :-1, :]
 
-        loss_mask = attention_mask[:, -logits_to_keep:].to(device=logits.device, dtype=logits.dtype).contiguous()
+        # QUAN TRỌNG: loss_mask phải cùng dtype với logits
+        loss_mask = (
+            attention_mask[:, -logits_to_keep:]
+            .to(device=logits.device, dtype=logits.dtype)
+            .contiguous()
+        )
         labels = input_ids[:, -logits_to_keep:].contiguous()
         logits = logits[:, -logits_to_keep:].contiguous()
 
-        # Divide logits by temperature
+        # Divide logits by sampling temperature
         logits = logits / max(1e-8, float(self.args.temperature))
-
+        
         logits_shape = logits.shape
         token_log_probs = -torch.nn.functional.cross_entropy(
             logits.view(-1, logits_shape[-1]),
             labels.view(-1),
             reduction="none",
         ).view(logits_shape[0], logits_shape[1])
-        token_log_probs = token_log_probs * loss_mask + (1.0 - loss_mask) * torch.finfo(logits.dtype).min
+        
+        token_log_probs = (
+            token_log_probs * loss_mask
+            + (1.0 - loss_mask) * torch.finfo(logits.dtype).min
+        )
         return token_log_probs
 
-    # ---------------------------
-    # compute_loss (unchanged logic but using safe dtypes)
-    # ---------------------------
-    def compute_loss(self, model, inputs, mode="train", return_metrics=False):
+    def compute_loss(
+        self, model, inputs, mode="train", return_metrics=False
+    ):
+        """Compute the GRPO loss."""
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        completion_ids, completion_mask = (
+            inputs["completion_ids"],
+            inputs["completion_mask"],
+        )
 
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(self.model.device, dtype=self.dtype if self.dtype is not None else torch.long)
+        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
+            self.model.device, dtype=torch.long
+        )
         logits_to_keep = completion_ids.size(1)
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(
+            model, input_ids, attention_mask, logits_to_keep
+        )
 
+        # Compute KL divergence if beta > 0
         if self.args.beta != 0.0:
             if self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(self.ref_model, input_ids, attention_mask, logits_to_keep)
+                ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, input_ids, attention_mask, logits_to_keep
+                )
             else:
                 ref_per_token_logps = per_token_logps.clone()
-            per_token_kl = (torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
+
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps)
+                - (ref_per_token_logps - per_token_logps)
+                - 1
+            )
 
         advantages = inputs["advantages"]
         old_per_token_logps = inputs.get("old_per_token_logps", None)
         if old_per_token_logps is None:
             old_per_token_logps = per_token_logps.detach()
 
+        # Calculate ratios and loss terms
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(
             coef_1,
@@ -413,6 +397,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         per_token_loss = torch.clamp(per_token_loss, -10.0, 10.0)
 
+        # Add KL penalty if beta > 0
         if self.args.beta != 0.0:
             per_token_loss = per_token_loss + self.args.beta * per_token_kl
 
@@ -420,52 +405,97 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         if self.args.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+            self._metrics[mode]["kl"].append(mean_kl.item())
 
         is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
         self._metrics[mode]["loss"].append(loss.item())
 
-        metrics = {"loss": loss.item(), "kl": mean_kl.item() if self.args.beta != 0.0 else None, "clip_ratio": clip_ratio.item()}
+        metrics = {
+            "loss": loss.item(),
+            "kl": mean_kl.item() if self.args.beta != 0.0 else None,
+            "clip_ratio": clip_ratio.item(),
+        }
+
         if return_metrics:
             return loss, metrics
         else:
             return loss
 
-    # ---------------------------
-    # Training loop + step (unchanged semantics but safe dtypes)
-    # ---------------------------
-    def train(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager) -> None:
+    def train(
+        self, state: GameState, data_manager: DataManager, reward_manager: RewardManager
+    ) -> None:
+        """Train the model using the given game state and reward manager."""
         self.model.train()
         global_step = self.global_step
         for stage in range(state.stage):
-            global_step = self.step(stage, state, data_manager, reward_manager, global_step)
+            global_step = self.step(
+                stage, state, data_manager, reward_manager, global_step
+            )
         self.global_step = global_step
         self.model.eval()
 
-    def step(self, stage: int, state: GameState, data_manager: DataManager, reward_manager: RewardManager, global_step: int) -> int:
+    def step(
+        self,
+        stage: int,
+        state: GameState,
+        data_manager: DataManager,
+        reward_manager: RewardManager,
+        global_step: int,
+    ) -> int:
         global_step += 1
 
+        # Prepare stage's inputs
         stage_inputs = state.get_stage_state(stage)
         stage_inputs, index_mapping = data_manager.prepare_input(stage_inputs, stage)
         assert stage_inputs is not None, f"No inputs found for stage {stage}"
+        
+        # Unflatten stage's outputs
         stage_actions = state.get_stage_actions(stage)
-        stage_outputs = [stage_actions[index_mapping[idx][0]][index_mapping[idx][1]][index_mapping[idx][2]] for idx, _ in enumerate(index_mapping)]
+        stage_outputs = [
+            stage_actions[index_mapping[idx][0]][index_mapping[idx][1]][
+                index_mapping[idx][2]
+            ]
+            for idx, _ in enumerate(index_mapping)
+        ]
         assert stage_outputs is not None, f"No outputs found for stage {stage}"
 
         metrics = {}
 
         model_inputs = {}
         processed_inputs = self._process_inputs(stage_inputs, for_training=True)
-        model_inputs["prompt_ids"], model_inputs["prompt_mask"] = processed_inputs.input_ids.to(self.model.device), processed_inputs.attention_mask.to(self.model.device, dtype=self.dtype if self.dtype is not None else torch.long)
-        processed_outputs = self._process_inputs(stage_outputs, with_template=False, for_training=True)
-        model_inputs["completion_ids"], model_inputs["completion_mask"] = processed_outputs.input_ids.to(self.model.device), processed_outputs.attention_mask.to(self.model.device, dtype=self.dtype if self.dtype is not None else torch.long)
+        model_inputs["prompt_ids"] = processed_inputs.input_ids.to(self.model.device)
+        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        model_inputs["prompt_mask"] = processed_inputs.attention_mask.to(
+            self.model.device, dtype=torch.long
+        )
+        
+        processed_outputs = self._process_inputs(
+            stage_outputs, with_template=False, for_training=True
+        )
+        model_inputs["completion_ids"] = processed_outputs.input_ids.to(self.model.device)
+        # QUAN TRỌNG: attention_mask LUÔN là torch.long
+        model_inputs["completion_mask"] = processed_outputs.attention_mask.to(
+            self.model.device, dtype=torch.long
+        )
 
         rewards = reward_manager[stage]
-        rewards = [rewards[index_mapping[idx][0]][index_mapping[idx][1]][index_mapping[idx][2]] for idx, _ in enumerate(index_mapping)]
+        rewards = [
+            rewards[index_mapping[idx][0]][index_mapping[idx][1]][index_mapping[idx][2]]
+            for idx, _ in enumerate(index_mapping)
+        ]
+
         assert rewards is not None, f"No rewards found for stage {stage}"
-        rewards = torch.tensor(rewards)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        
+        # Validate rewards
+        if torch.isnan(rewards).any() or torch.isinf(rewards).any():
+            print(f"Warning: Invalid rewards at stage {stage}, cleaning...")
+            rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        
         do_training = (rewards != 0).any()
+        
         if do_training:
             with torch.no_grad():
                 advantages = rewards - rewards.mean(dim=1, keepdim=True)
@@ -475,16 +505,23 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 prompt_ids, prompt_mask = model_inputs["prompt_ids"], model_inputs["prompt_mask"]
                 completion_ids, completion_mask = model_inputs["completion_ids"], model_inputs["completion_mask"]
                 input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
-                attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(self.model.device, dtype=self.dtype if self.dtype is not None else torch.long)
+                # QUAN TRỌNG: attention_mask LUÔN là torch.long
+                attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
+                    self.model.device, dtype=torch.long
+                )
                 logits_to_keep = completion_ids.size(1)
-                old_per_token_logps_full = self._get_per_token_logps(self.model, input_ids, attention_mask, logits_to_keep).detach()
+                old_per_token_logps_full = self._get_per_token_logps(
+                    self.model, input_ids, attention_mask, logits_to_keep
+                ).detach()
 
-            advantages = torch.flatten(advantages).to(self.model.device, dtype=self.dtype if self.dtype is not None else torch.float32)
+            # QUAN TRỌNG: advantages luôn là float32
+            advantages = torch.flatten(advantages).to(self.model.device, dtype=torch.float32)
             model_inputs["advantages"] = advantages.squeeze(dim=-1)
+            
             num_samples = model_inputs["completion_ids"].size(0)
             updates_per_rollout = self.args.ppo_epochs
-
             minibatch_size = min(self.args.minibatch_size, num_samples)
+            
             loss_vals = []
             for _ in range(updates_per_rollout):
                 perm = torch.randperm(num_samples, device=self.model.device)
@@ -509,9 +546,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         return global_step
 
-    # ---------------------------
-    # Helpers
-    # ---------------------------
     def _return_minibatch(self, model_inputs, idx, old_per_token_logps_full):
         mb_inputs = {
             "prompt_ids": model_inputs["prompt_ids"][idx],
@@ -525,18 +559,19 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     @torch.no_grad()
     def evaluate(self, state: GameState, data_manager: DataManager, reward_manager: RewardManager):
-        # Keep evaluate minimal here; the calling wrapper (your GRPOTrainerModule subclass) can override
-        return None
+        pass
 
-    # Save/load/cleanup (unchanged)
     def save(self, save_dir: str) -> None:
+        """Save the model and trainer state to the given directory."""
         os.makedirs(save_dir, exist_ok=True)
-        # saving model using huggingface method
+        
+        # Save model using HuggingFace method
         try:
             self.model.save_pretrained(save_dir)
         except Exception:
             torch.save(self.model.state_dict(), os.path.join(save_dir, "model_state.pt"))
 
+        # Save additional state
         torch.save(
             {
                 "metrics": self._metrics,
@@ -548,17 +583,22 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     @classmethod
     def load(cls, load_dir: str) -> "GRPOLanguageTrainerModule":
+        """Load a trainer module from the given directory."""
         model = AutoModelForCausalLM.from_pretrained(load_dir)
         trainer = cls([model])
+        
         trainer_state = torch.load(os.path.join(load_dir, "trainer_state.pt"))
         trainer._metrics = trainer_state["metrics"]
         trainer._total_train_tokens = trainer_state["total_train_tokens"]
         trainer.generation_config = trainer_state["generation_config"]
+
         return trainer
 
     def cleanup_step(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         gc.collect()
 
     def cleanup(self):
